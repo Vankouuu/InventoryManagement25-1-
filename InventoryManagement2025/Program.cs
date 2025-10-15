@@ -1,6 +1,10 @@
 ﻿using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
 using InventoryManagement2025.Data;
+using InventoryManagement2025.Models;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -32,8 +36,75 @@ builder.Services.AddCors(options =>
 // Add Swagger and DbContext
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+// Ensure the SQLite DB path is absolute (based on the app's base directory) so it works regardless of current working directory
+string? conn = builder.Configuration.GetConnectionString("DefaultConnection");
+if (string.IsNullOrWhiteSpace(conn))
+{
+    var dbPath = Path.Combine(AppContext.BaseDirectory, "school_inventory.db");
+    conn = $"Data Source={dbPath};Cache=Shared";
+}
+else if (conn.Contains("Data Source=", StringComparison.OrdinalIgnoreCase))
+{
+    var parts = conn.Split(';', StringSplitOptions.RemoveEmptyEntries);
+    for (int i = 0; i < parts.Length; i++)
+    {
+        var p = parts[i].Trim();
+        if (p.StartsWith("Data Source=", StringComparison.OrdinalIgnoreCase))
+        {
+            var value = p[(p.IndexOf('=') + 1)..].Trim();
+            if (!Path.IsPathRooted(value))
+            {
+                value = Path.Combine(AppContext.BaseDirectory, value);
+                parts[i] = $"Data Source={value}";
+            }
+        }
+    }
+    conn = string.Join(';', parts);
+}
+
 builder.Services.AddDbContext<SchoolInventory>(options =>
-    options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
+    options.UseSqlite(conn));
+
+// Configure Identity
+builder.Services.AddIdentity<AppUser, IdentityRole>(options =>
+{
+    options.Password.RequireDigit = true;
+    options.Password.RequiredLength = 6;
+    options.Password.RequireNonAlphanumeric = false;
+    options.Password.RequireUppercase = false;
+})
+    .AddEntityFrameworkStores<SchoolInventory>()
+    .AddDefaultTokenProviders();
+
+// Configure JWT authentication
+var jwtSection = builder.Configuration.GetSection("JwtSettings");
+// Use a safe dev fallback but prefer env/appsettings. Enforce 256-bit (32+ ASCII chars).
+var jwtKey = builder.Configuration["JwtSettings:Key"] ?? "DevSigningKey_MUST_CHANGE_AtLeast32Chars_Long_123456!";
+var keyBytes = Encoding.ASCII.GetBytes(jwtKey);
+if (keyBytes.Length < 32)
+{
+    throw new InvalidOperationException(
+        $"JwtSettings:Key must be at least 32 ASCII characters (256 bits). Current length={keyBytes.Length}. " +
+        "Set environment variable JwtSettings__Key or appsettings.Development.json.");
+}
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = "JwtBearer";
+    options.DefaultChallengeScheme = "JwtBearer";
+})
+    .AddJwtBearer("JwtBearer", options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = false,
+            ValidateAudience = false,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(keyBytes),
+            ValidateLifetime = true
+        };
+    });
+
+builder.Services.AddAuthorization();
 
 var app = builder.Build();
 
@@ -46,6 +117,36 @@ using (var scope = app.Services.CreateScope())
         var context = services.GetRequiredService<SchoolInventory>();
         context.Database.Migrate();
         DbInit.Initialize(context);
+        // Seed roles and an initial admin user
+        var roleManager = services.GetRequiredService<RoleManager<IdentityRole>>();
+        var userManager = services.GetRequiredService<UserManager<AppUser>>();
+
+        var adminEmail = builder.Configuration["SeedAdmin:Email"] ?? "admin@school.local";
+        var adminPassword = builder.Configuration["SeedAdmin:Password"] ?? "Admin123!";
+        var adminRole = "Admin";
+        var userRole = "User";
+
+        if (!roleManager.RoleExistsAsync(adminRole).GetAwaiter().GetResult())
+        {
+            roleManager.CreateAsync(new IdentityRole(adminRole)).GetAwaiter().GetResult();
+        }
+        if (!roleManager.RoleExistsAsync(userRole).GetAwaiter().GetResult())
+        {
+            roleManager.CreateAsync(new IdentityRole(userRole)).GetAwaiter().GetResult();
+        }
+
+        var existingAdmin = userManager.FindByEmailAsync(adminEmail).GetAwaiter().GetResult();
+        if (existingAdmin == null)
+        {
+            var adminUser = new AppUser { UserName = adminEmail, Email = adminEmail, EmailConfirmed = true };
+            var createResult = userManager.CreateAsync(adminUser, adminPassword).GetAwaiter().GetResult();
+            if (createResult.Succeeded)
+            {
+                userManager.AddToRoleAsync(adminUser, adminRole).GetAwaiter().GetResult();
+                var logger = services.GetRequiredService<ILogger<Program>>();
+                logger.LogInformation($"Seeded admin user '{adminEmail}' with default password. Change the password immediately.");
+            }
+        }
     }
     catch (Exception ex)
     {
@@ -60,15 +161,75 @@ if (app.Environment.IsDevelopment())
     app.UseCors("AllowAll");
     app.UseSwagger();
     app.UseSwaggerUI();
+    // Redirect root to Swagger UI for convenience during development
+    app.MapGet("/", () => Results.Redirect("/swagger"));
 }
 else
 {
     app.UseHttpsRedirection();
     // CORS active in production
     //app.UseCors("AllowAll"); 
+    // Provide a simple root response in production
+    app.MapGet("/", () => Results.Text("InventoryManagement2025 API is running. Use your client or enable Swagger in Development."));
 }
 
+app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
+
+// Minimal auth endpoints (register/login) for testing
+app.MapPost("/api/auth/register", async (UserManager<AppUser> userManager, RegisterRequest request) =>
+{
+    var user = new AppUser { UserName = request.Email, Email = request.Email };
+    var result = await userManager.CreateAsync(user, request.Password);
+    if (!result.Succeeded)
+        return Results.BadRequest(result.Errors);
+
+    return Results.Ok(new { user.Id, user.Email });
+});
+
+app.MapPost("/api/auth/login", async (UserManager<AppUser> userManager, IConfiguration config, LoginRequest request) =>
+{
+    var user = await userManager.FindByEmailAsync(request.Email);
+    if (user == null) return Results.Unauthorized();
+    var valid = await userManager.CheckPasswordAsync(user, request.Password);
+    if (!valid) return Results.Unauthorized();
+
+    var jwtKeyLocal = config["JwtSettings:Key"] ?? "DevSigningKey_MUST_CHANGE_AtLeast32Chars_Long_123456!";
+    var tokenHandler = new System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler();
+    var tokenKey = Encoding.ASCII.GetBytes(jwtKeyLocal);
+    var roles = await userManager.GetRolesAsync(user);
+    var claims = new List<System.Security.Claims.Claim>
+    {
+        new System.Security.Claims.Claim("id", user.Id ?? string.Empty),
+        new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.Email, user.Email ?? string.Empty)
+    };
+    foreach (var r in roles)
+    {
+        claims.Add(new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.Role, r));
+    }
+    var tokenDescriptor = new SecurityTokenDescriptor
+    {
+        Subject = new System.Security.Claims.ClaimsIdentity(claims),
+        Expires = DateTime.UtcNow.AddHours(12),
+        SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(tokenKey), SecurityAlgorithms.HmacSha256Signature)
+    };
+    var token = tokenHandler.CreateToken(tokenDescriptor);
+    var tokenString = tokenHandler.WriteToken(token);
+
+    return Results.Ok(new { Token = tokenString });
+});
+
+// Who am I endpoint to verify token contents
+app.MapGet("/api/auth/me", [Microsoft.AspNetCore.Authorization.Authorize] (System.Security.Claims.ClaimsPrincipal user) =>
+{
+    var id = user.FindFirst("id")?.Value;
+    var email = user.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value;
+    var roles = user.FindAll(System.Security.Claims.ClaimTypes.Role).Select(c => c.Value).ToArray();
+    return Results.Ok(new { id, email, roles });
+});
+
+// Simple health check endpoint
+app.MapGet("/health", (IWebHostEnvironment env) => Results.Json(new { status = "ok", environment = env.EnvironmentName }));
 
 app.Run();
